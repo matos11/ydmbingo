@@ -1,232 +1,289 @@
-const express = require('express');
-const http = require('http');
-const socketIo = require('socket.io');
-const cors = require('cors');
+/**
+ * YDM Bingo — Backend Game Runner
+ * ════════════════════════════════════════════════════════════════
+ * Run this on your server (VPS / Railway / Render / any Node host).
+ * It owns ALL number drawing — no browser host, no lag, no races.
+ *
+ * Usage:
+ *   node game-runner.js
+ *
+ * Required env vars (or edit CONFIG below):
+ *   FIREBASE_PROJECT_ID   — your Firebase project id
+ *   FIREBASE_DB_URL       — e.g. https://ydm-bingo-realtime-default-rtdb.firebaseio.com
+ *   GOOGLE_APPLICATION_CREDENTIALS — path to your serviceAccountKey.json
+ *
+ * Deployment examples:
+ *   • Railway / Render: add the env vars in the dashboard, upload this file + package.json
+ *   • VPS:  pm2 start game-runner.js --name ydm-bingo
+ * ════════════════════════════════════════════════════════════════
+ */
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+const admin = require("firebase-admin");
 
-const server = http.createServer(app);
-const io = socketIo(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] },
-    transports: ['websocket', 'polling']
-});
+// ── CONFIG ────────────────────────────────────────────────────────
+const CONFIG = {
+  projectId : process.env.FIREBASE_PROJECT_ID  || "ydm-bingo-realtime",
+  databaseURL: process.env.FIREBASE_DB_URL      || "https://ydm-bingo-realtime-default-rtdb.firebaseio.com",
+  drawIntervalMs : 3000,   // ms between drawn numbers (3 s)
+  winCollectMs   : 2500,   // ms to wait after first winner before closing game
+  minPlayers     : 2,      // minimum players needed to start
+  maxNumbers     : 75,
+};
 
-// Game state storage
-let games = new Map();             // gameId -> { active, drawnNumbers, prizePool, winPatterns }
-let players = new Map();           // socketId -> { id, name, phone, cards: [][], room }
-let lobbyTimer = null;
-let lobbyTimeLeft = 30;            // 30 seconds countdown
-const MIN_PLAYERS_TO_START = 2;
+// ── FIREBASE INIT ────────────────────────────────────────────────
+const credPath = process.env.GOOGLE_APPLICATION_CREDENTIALS;
+if (credPath) {
+  admin.initializeApp({
+    credential   : admin.credential.cert(require(credPath)),
+    databaseURL  : CONFIG.databaseURL,
+  });
+} else {
+  // Fallback: applicationDefault (works on GCP / Cloud Functions automatically)
+  admin.initializeApp({
+    credential   : admin.credential.applicationDefault(),
+    databaseURL  : CONFIG.databaseURL,
+  });
+}
+const db = admin.database();
 
-// --- BINGO CORE ENGINE HELPERS ---
+// ── BINGO PATTERNS ───────────────────────────────────────────────
+const PATTERNS = [
+  { n: "Row 1",    i: [0,1,2,3,4] },
+  { n: "Row 2",    i: [5,6,7,8,9] },
+  { n: "Row 3",    i: [10,11,12,13,14] },
+  { n: "Row 4",    i: [15,16,17,18,19] },
+  { n: "Row 5",    i: [20,21,22,23,24] },
+  { n: "Col B",    i: [0,5,10,15,20] },
+  { n: "Col I",    i: [1,6,11,16,21] },
+  { n: "Col N",    i: [2,7,12,17,22] },
+  { n: "Col G",    i: [3,8,13,18,23] },
+  { n: "Col O",    i: [4,9,14,19,24] },
+  { n: "Diag \\",  i: [0,6,12,18,24] },
+  { n: "Diag /",   i: [4,8,12,16,20] },
+  { n: "4 Corners",i: [0,4,20,24] },
+  { n: "T-shape",  i: [0,1,2,3,4,7,12,17,22] },
+  { n: "L-shape",  i: [0,5,10,15,20,21,22,23,24] },
+  { n: "Full Card", i: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24] },
+];
 
-// Generates a valid 5x5 Bingo matrix adhering to B-I-N-G-O column rules
-function generateBingoCard() {
-    const card = [];
-    const ranges = [
-        { min: 1, max: 15 },   // B
-        { min: 16, max: 30 },  // I
-        { min: 31, max: 45 },  // N
-        { min: 46, max: 60 },  // G
-        { min: 61, max: 75 }   // O
-    ];
-    
-    // Create columns
-    const columns = ranges.map(range => {
-        const pool = Array.from({ length: range.max - range.min + 1 }, (_, i) => range.min + i);
-        const col = [];
-        for (let i = 0; i < 5; i++) {
-            const idx = Math.floor(Math.random() * pool.length);
-            col.push(pool.splice(idx, 1)[0]);
-        }
-        return col.sort((a, b) => a - b);
-    });
+// ── HELPERS ──────────────────────────────────────────────────────
+function letter(n) { return n<=15?"B":n<=30?"I":n<=45?"N":n<=60?"G":"O"; }
+function log(...a) { console.log(`[${new Date().toISOString()}]`, ...a); }
 
-    // Transpose columns into 5 rows
-    for (let r = 0; r < 5; r++) {
-        const row = [];
-        for (let c = 0; c < 5; c++) {
-            if (r === 2 && c === 2) {
-                row.push(0); // FREE SPACE marker
-            } else {
-                row.push(columns[c][r]);
-            }
-        }
-        card.push(row);
-    }
-    return card;
+// ── GAME STATE ───────────────────────────────────────────────────
+let drawn         = [];
+let drawTimer     = null;
+let winCollectTimer = null;
+let gameRunning   = false;
+
+// ── REGISTER AS BACKEND RUNNER ───────────────────────────────────
+// Write a runner heartbeat so the frontend knows numbers come from backend.
+async function registerRunner() {
+  await db.ref("activeGame/runner").set({
+    pid    : process.pid,
+    startedAt : admin.database.ServerValue.TIMESTAMP,
+    status : "active",
+  });
+  // Remove on exit
+  await db.ref("activeGame/runner").onDisconnect().remove();
+  log("Runner registered (pid", process.pid + ")");
 }
 
-function generateNumber(drawnNumbers) {
-    let available = Array.from({ length: 75 }, (_, i) => i + 1).filter(n => !drawnNumbers.includes(n));
-    if (available.length === 0) return null;
-    return available[Math.floor(Math.random() * available.length)];
+// ── DRAW ONE NUMBER ──────────────────────────────────────────────
+async function drawNumber() {
+  // Re-read drawn numbers from DB (authoritative source, avoids drift)
+  const snap = await db.ref("activeGame/drawnNumbers").once("value");
+  const serverDrawn = new Set();
+  if (snap.exists()) snap.forEach(c => { if (c.val()?.number) serverDrawn.add(c.val().number); });
+
+  // Merge with local cache
+  serverDrawn.forEach(n => { if (!drawn.includes(n)) drawn.push(n); });
+
+  if (drawn.length >= CONFIG.maxNumbers) {
+    log("All 75 numbers drawn — ending game (no winner)");
+    await endGame(null);
+    return;
+  }
+
+  // Pick random available number
+  const available = [];
+  for (let i = 1; i <= CONFIG.maxNumbers; i++) if (!serverDrawn.has(i)) available.push(i);
+  if (!available.length) { await endGame(null); return; }
+
+  const n = available[Math.floor(Math.random() * available.length)];
+  drawn.push(n);
+
+  await db.ref(`activeGame/drawnNumbers/${n}`).set({
+    number   : n,
+    letter   : letter(n),
+    drawnAt  : admin.database.ServerValue.TIMESTAMP,
+    sequence : drawn.length,
+  });
+  log(`Drew: ${letter(n)}${n}  (${drawn.length}/75)`);
 }
 
-// Strictly verifies if a card actually won based on server drawn numbers
-function verifyBingoClaim(card, drawnNumbers, targetIndices) {
-    // Treat 0 as automatically hit (FREE SPACE)
-    const hits = card.map(row => row.map(num => num === 0 || drawnNumbers.includes(num)));
-    
-    // Flatten the 5x5 matrix to a 1D array of 25 items matching front-end map styles
-    const flatHits = hits.flat();
-    
-    // Check if every index specified in the pattern has been drawn
-    return targetIndices.every(index => flatHits[index] === true);
+// ── START DRAW LOOP ───────────────────────────────────────────────
+function startDrawLoop() {
+  if (drawTimer) clearInterval(drawTimer);
+  log(`Draw loop started — interval ${CONFIG.drawIntervalMs}ms`);
+  drawTimer = setInterval(async () => {
+    if (!gameRunning) { clearInterval(drawTimer); return; }
+    // Check game not already ended in DB
+    const endedSnap = await db.ref("activeGame/ended").once("value");
+    if (endedSnap.val() === true) { gameRunning = false; clearInterval(drawTimer); return; }
+    await drawNumber();
+  }, CONFIG.drawIntervalMs);
 }
 
-// --- SYSTEM LOGIC CONTROLLERS ---
-
-function manageLobbyTimer() {
-    const activeCount = players.size;
-
-    if (activeCount >= MIN_PLAYERS_TO_START) {
-        if (!lobbyTimer) {
-            lobbyTimeLeft = 30; // Reset
-            io.emit('lobby-timer-updated', { timeLeft: lobbyTimeLeft, status: "waiting" });
-            
-            lobbyTimer = setInterval(() => {
-                lobbyTimeLeft--;
-                io.emit('lobby-timer-updated', { timeLeft: lobbyTimeLeft, status: "counting" });
-
-                if (lobbyTimeLeft <= 0) {
-                    clearInterval(lobbyTimer);
-                    lobbyTimer = null;
-                    autoStartNewGame();
-                }
-            }, 1000);
-        }
-    } else {
-        if (lobbyTimer) {
-            clearInterval(lobbyTimer);
-            lobbyTimer = null;
-            io.emit('lobby-timer-updated', { timeLeft: null, status: "stopped", message: "Need more players" });
-        }
-    }
+// ── WINNER VERIFICATION ──────────────────────────────────────────
+// The backend verifies each claimed win against the drawn numbers.
+// Invalid claims are rejected; valid ones are confirmed.
+function verifyWin(claimEntry, drawnSet) {
+  const { cardFull, patternIndices } = claimEntry;
+  if (!cardFull || !patternIndices) return false;
+  // Free cell (index 12) always counts
+  return patternIndices.every(idx => {
+    if (idx === 12) return true;
+    const val = parseInt(cardFull[idx]);
+    return drawnSet.has(val);
+  });
 }
 
-function autoStartNewGame() {
-    const gameId = "GAME_" + Date.now();
-    const game = {
-        gameId: gameId,
-        prizePool: (players.size * 100).toString(), // Dynamic calculations based on player entries
-        drawnNumbers: [],
-        active: true,
-        startedAt: Date.now()
+// ── HANDLE WINNER CLAIMS ─────────────────────────────────────────
+async function handleWinnerClaims() {
+  const winnersSnap = await db.ref("activeGame/winners").once("value");
+  if (!winnersSnap.exists()) { await endGame(null); return; }
+
+  const drawnSet = new Set(drawn);
+  const allClaims = Object.entries(winnersSnap.val());
+  
+  // Verify each claim
+  const valid = allClaims.filter(([, v]) => verifyWin(v, drawnSet));
+  
+  if (valid.length === 0) {
+    log("All claims failed verification — continuing game");
+    // Remove invalid claims and continue
+    await db.ref("activeGame/winners").remove();
+    gameRunning = true;
+    startDrawLoop();
+    return;
+  }
+
+  log(`${valid.length} valid winner(s): ${valid.map(([,v]) => v.name + " card#" + v.cardNum).join(", ")}`);
+
+  // Fetch prize pool
+  const takenSnap    = await db.ref("lobby/takenCards").once("value");
+  const stakeSnap    = await db.ref("activeGame/stake").once("value");
+  const takenCount   = takenSnap.exists() ? Object.keys(takenSnap.val()).length : 0;
+  const stakeVal     = parseInt(stakeSnap.val() || "10");
+  const totalPrize   = Math.floor(takenCount * stakeVal * 0.8);
+  const splitPrize   = Math.floor(totalPrize / valid.length);
+
+  // Write verified winners with prize info
+  const verifiedMap = {};
+  valid.forEach(([key, claim]) => {
+    verifiedMap[key] = {
+      ...claim,
+      verified    : true,
+      totalPrize,
+      splitPrize,
+      totalWinners: valid.length,
     };
+  });
 
-    games.set(gameId, game);
-    io.emit('game-started', { gameId: gameId, prizePool: game.prizePool });
+  await db.ref("activeGame/verifiedWinners").set(verifiedMap);
+  log(`Prize: ${totalPrize} ETB total / ${splitPrize} ETB each`);
 
-    // Internal Game loop clock execution 
-    const interval = setInterval(() => {
-        const currentGame = games.get(gameId);
-        if (!currentGame || !currentGame.active) {
-            clearInterval(interval);
-            return;
-        }
-
-        const newNumber = generateNumber(currentGame.drawnNumbers);
-        if (newNumber) {
-            currentGame.drawnNumbers.push(newNumber);
-            io.emit('number-drawn', { gameId: gameId, number: newNumber });
-
-            if (currentGame.drawnNumbers.length >= 75) {
-                clearInterval(interval);
-                currentGame.active = false;
-                io.emit('game-full-ended', { gameId: gameId });
-            }
-        }
-    }, 4000); // 4 Seconds draw loop smooth delivery
+  await endGame(verifiedMap);
 }
 
-// --- SOCKET CONNECTION GATEWAY ---
+// ── END GAME ─────────────────────────────────────────────────────
+async function endGame(verifiedWinners) {
+  gameRunning = false;
+  if (drawTimer) { clearInterval(drawTimer); drawTimer = null; }
+  if (winCollectTimer) { clearTimeout(winCollectTimer); winCollectTimer = null; }
 
-io.on('connection', (socket) => {
-    console.log('Client connected:', socket.id);
+  await db.ref("activeGame").update({
+    ended      : true,
+    endedAt    : admin.database.ServerValue.TIMESTAMP,
+    totalDrawn : drawn.length,
+  });
 
-    // Cartela generation requested by front-end client
-    socket.on('request-cartelas', (data) => {
-        const count = data.count || 1;
-        const generatedCards = [];
-        for(let i=0; i < count; i++) {
-            generatedCards.push(generateBingoCard());
-        }
-        // Reply exclusively to the requester
-        socket.emit('receive-cartelas', { cards: generatedCards });
+  log("Game ended —", verifiedWinners ? Object.keys(verifiedWinners).length + " winner(s)" : "no winners");
+
+  // Keep runner alive to watch for next game
+  watchForNextGame();
+}
+
+// ── WATCH FOR NEXT GAME ──────────────────────────────────────────
+function watchForNextGame() {
+  log("Watching for next game...");
+  db.ref("activeGame/started").on("value", async snap => {
+    if (snap.val() === true && !gameRunning) {
+      const endedSnap = await db.ref("activeGame/ended").once("value");
+      if (endedSnap.val() === true) return; // stale game
+      log("New game detected — starting draw loop");
+      drawn = [];
+      gameRunning = true;
+      db.ref("activeGame/started").off(); // unsubscribe; re-subscribe after each game end
+      startDrawLoop();
+    }
+  });
+
+  // Watch for winner claims to verify
+  db.ref("activeGame/winners").on("child_added", async () => {
+    if (!gameRunning) return;
+    // Collect window: wait for simultaneous claims
+    if (winCollectTimer) clearTimeout(winCollectTimer);
+    winCollectTimer = setTimeout(async () => {
+      gameRunning = false;
+      if (drawTimer) { clearInterval(drawTimer); drawTimer = null; }
+      log(`Winner claim(s) received — verifying after ${CONFIG.winCollectMs}ms window`);
+      await handleWinnerClaims();
+    }, CONFIG.winCollectMs);
+  });
+}
+
+// ── MAIN ─────────────────────────────────────────────────────────
+async function main() {
+  log("YDM Bingo Backend Runner starting...");
+
+  await registerRunner();
+
+  // Check if a game is already in progress
+  const [startedSnap, endedSnap, drawnSnap] = await Promise.all([
+    db.ref("activeGame/started").once("value"),
+    db.ref("activeGame/ended").once("value"),
+    db.ref("activeGame/drawnNumbers").once("value"),
+  ]);
+
+  if (startedSnap.val() === true && endedSnap.val() !== true) {
+    // Resume in-progress game
+    if (drawnSnap.exists()) {
+      drawnSnap.forEach(c => { if (c.val()?.number) drawn.push(c.val().number); });
+      drawn.sort((a,b) => a - b);
+    }
+    log(`Resuming game — ${drawn.length} numbers already drawn`);
+    gameRunning = true;
+    startDrawLoop();
+
+    // Also set up winner watch for the resumed game
+    db.ref("activeGame/winners").on("child_added", async () => {
+      if (!gameRunning) return;
+      if (winCollectTimer) clearTimeout(winCollectTimer);
+      winCollectTimer = setTimeout(async () => {
+        gameRunning = false;
+        if (drawTimer) { clearInterval(drawTimer); drawTimer = null; }
+        await handleWinnerClaims();
+      }, CONFIG.winCollectMs);
     });
+  } else {
+    watchForNextGame();
+  }
 
-    socket.on('join-game', (data) => {
-        players.set(socket.id, {
-            id: socket.id,
-            name: data.name,
-            phone: data.phone,
-            cards: data.cards || [] // Store generated cards safely inside map reference
-        });
+  // Graceful shutdown
+  process.on("SIGTERM", async () => { log("SIGTERM — shutting down"); await db.ref("activeGame/runner").remove(); process.exit(0); });
+  process.on("SIGINT",  async () => { log("SIGINT — shutting down");  await db.ref("activeGame/runner").remove(); process.exit(0); });
+}
 
-        io.emit('player-count', players.size);
-        manageLobbyTimer();
-
-        // Catch-up sync for mid-game joins or page reloads
-        for (let [gameId, game] of games.entries()) {
-            if (game.active) {
-                socket.emit('game-started', { gameId: gameId, prizePool: game.prizePool });
-                socket.emit('game-state', { drawnNumbers: game.drawnNumbers, prizePool: game.prizePool });
-                break;
-            }
-        }
-    });
-
-    socket.on('claim-bingo', (data) => {
-        const { gameId, patternIndices, cardIndex } = data;
-        const game = games.get(gameId);
-        const player = players.get(socket.id);
-
-        if (!game || !game.active) {
-            socket.emit('claim-rejected', { message: 'Game is inactive or already closed.' });
-            return;
-        }
-        if (!player || !player.cards[cardIndex]) {
-            socket.emit('claim-rejected', { message: 'Invalid player profile context or Card data reference missing.' });
-            return;
-        }
-
-        // BACKEND CRITICAL VERIFICATION CHALLENGE
-        const targetedCard = player.cards[cardIndex];
-        const isLegitWin = verifyBingoClaim(targetedCard, game.drawnNumbers, patternIndices);
-
-        if (isLegitWin) {
-            game.active = false;
-            game.winner = {
-                name: player.name,
-                phone: player.phone,
-                cardIndex: cardIndex,
-                prize: game.prizePool,
-                claimedAt: Date.now()
-            };
-
-            io.emit('winner-declared', game.winner);
-
-            setTimeout(() => {
-                games.delete(gameId);
-                manageLobbyTimer(); // Restart loop checks for upcoming games
-            }, 15000);
-        } else {
-            // Anti-cheat flag logging system fallback
-            console.warn(`Suspicious Claim Attempt dropped from socket instance: ${socket.id}`);
-            socket.emit('claim-rejected', { message: 'Invalid claim! Numbers missing from selection history.' });
-        }
-    });
-
-    socket.on('disconnect', () => {
-        players.delete(socket.id);
-        io.emit('player-count', players.size);
-        manageLobbyTimer();
-        console.log('Client disconnected:', socket.id);
-    });
-});
-
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Bingo Server processing on port ${PORT}`));
+main().catch(e => { console.error("Fatal:", e); process.exit(1); });
